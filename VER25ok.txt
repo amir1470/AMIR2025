@@ -1,0 +1,2034 @@
+//+------------------------------------------------------------------+
+//|                     SBS DIAMOND PRO Ver 24                      |
+//|                  Multi-strategy Expert Advisor (EA)              |
+//|                 Compatible with GOLD (Gold/XAUUSD)               |
+//|                 Author: amirbs14 - github.com/amirbs14           |
+//+------------------------------------------------------------------+
+
+#property copyright "amirbs14"
+#property link      "https://github.com/amirbs14"
+#property version   "24.0"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\HistoryOrderInfo.mqh>
+#include <Trade\DealInfo.mqh>
+#include <Indicators\Trend.mqh>
+#include <Indicators\Oscilators.mqh>
+#include <Indicators\Volumes.mqh>
+#include <Graphics\Graphic.mqh>
+#include <Generic\ArrayList.mqh>
+#include <Arrays\ArrayObj.mqh>
+#include <Generic\HashMap.mqh>
+#include <ChartObjects\ChartObjectsTxtControls.mqh>
+#include <ChartObjects\ChartObjectsShapes.mqh>
+
+// Déclarations des constantes globales
+#define STRATEGY_COUNT 6
+#define MAX_POSITIONS_PER_SYMBOL 3
+#define MAX_SYMBOLS 20
+#define MAX_RETRIES 3
+
+// Prototypes de fonctions
+void DrawDashboard();
+void UpdateDashboard();
+void DeleteDashboard();
+void DisplayLabel(string name, string text, int x, int y, color txtColor, int size, bool bold=false);
+string LastStrategyUsed();
+void GetTodayStats(int &totalTrades, int &winTrades, int &lossTrades);
+double GetDailyProfit();
+double CalculateWinRate();
+
+// Fonction SafeCopyBuffer améliorée
+bool SafeCopyBuffer(int handle, int buffer_num, int start_pos, int count, double &buffer[], string label = "") {
+    // Vérification du handle
+    if(handle == INVALID_HANDLE) {
+        Print(label, " - Handle invalide");
+        return false;
+    }
+
+    // Vérification que le graphique contient assez de données
+    if(Bars(_Symbol, _Period) < 50) {
+        Print(label, " - Pas assez de barres chargées sur le graphique (", Bars(_Symbol, _Period), ")");
+        return false;
+    }
+
+    // Attente que l'indicateur ait calculé suffisamment de barres
+    int attempts = 0;
+    int barsAvailable = BarsCalculated(handle);
+
+    while((barsAvailable < start_pos + count || barsAvailable <= 0) && attempts < MAX_RETRIES) {
+        Sleep(100);
+        attempts++;
+        barsAvailable = BarsCalculated(handle);
+    }
+
+    // Échec après plusieurs tentatives
+    if(barsAvailable < start_pos + count || barsAvailable <= 0) {
+        Print(label, " - Données insuffisantes (", barsAvailable, " bars, besoin de ", (start_pos + count), ") après ", MAX_RETRIES, " tentatives");
+        return false;
+    }
+
+    // Lecture du buffer
+    int copied = CopyBuffer(handle, buffer_num, start_pos, count, buffer);
+    if(copied <= 0) {
+        int err = GetLastError();
+        Print(label, " - Échec de CopyBuffer (erreur ", err, ")");
+        return false;
+    }
+
+    // Vérification du nombre d'éléments copiés
+    if(copied != count) {
+        Print(label, " - Copie partielle: ", copied, "/", count, " éléments");
+        return false;
+    }
+
+    // Vérification du contenu du buffer
+    int validValues = 0;
+    for(int i = 0; i < count; i++) {
+        if(buffer[i] != EMPTY_VALUE && MathIsValidNumber(buffer[i])) {
+            validValues++;
+        } else {
+            Print(label, " - Données invalides ignorées à la position ", i, " (valeur = ", buffer[i], ")");
+        }
+    }
+
+    if(validValues == 0) {
+        Print(label, " - Aucune donnée valide reçue (", count, " valeurs demandées)");
+        return false;
+    }
+
+    return true;
+}
+
+// Paramètres d'entrée
+input group "Risk Management"
+input double   MaxDailyLossPercent = 3.0;    // Max daily loss (% of balance)
+input double   MaxLossPercent = 1.5;         // Max loss per trade (% of balance)
+input int      MaxConsecutiveLosses = 5;     // Max consecutive losses before pause
+input int      PauseAfterLosses = 3;         // Pause after X consecutive losses
+input int      PauseDurationMinutes = 30;    // Pause duration in minutes
+input int      MinMinutesBetweenTrades = 5;  // Min time between trades
+input bool     EnableStrategyAutoManagement = true; // Auto strategy management
+input bool     EnableNotifications = true;   // Enable notifications
+
+input group "SuperTrend Settings"
+input int      SuperTrend_ATRPeriod    = 10;    // Période ATR pour SuperTrend
+input double   SuperTrend_Multiplier   = 3.0;   // Multiplicateur pour SuperTrend
+input bool     EnableSuperTrendInput = true; // Enable SuperTrend strategy
+
+// Paramètres Checklist Strategy
+input int      Checklist_MACD_Fast = 8;
+input int      Checklist_MACD_Slow = 20;
+input int      Checklist_MACD_Signal = 9;
+input double   Checklist_RSI_Min = 30.0;
+input double   Checklist_RSI_Max = 70.0;
+input double   Checklist_ADX_Min = 25.0;
+
+// Paramètres supplémentaires
+input int      MinTradesToDisable = 20;    // Min trades before disabling strategy
+input double   MinWinRateToDisable = 40.0; // Min win rate (%) to keep strategy enabled
+input int      ReEnableAfterHours = 24;    // Hours before re-enabling disabled strategy
+
+// Paramètres de trading
+input double    InitialLot        = 0.01;     // Initial lot size for trades
+input double    MaxLot            = 5.0;      // Maximum allowed lot size
+input double    RiskPercent       = 1.0;      // Risk per trade (% of balance)
+input int       MagicNumber       = 20200520; // Unique magic number for orders
+input int       Slippage          = 5;        // Max slippage (points)
+input int       ATRPeriod         = 14;       // ATR period for volatility filter
+input int       DashboardPosX     = 10;       // Dashboard X position (pixels)
+input int       DashboardPosY     = 10;       // Dashboard Y position (pixels)
+input int       DashboardWidth    = 420;      // Dashboard width (pixels)
+input int       DashboardHeight   = 220;      // Dashboard height (pixels)
+input bool      EnableSound       = true;     // Enable sound alerts
+
+// Enums et structures
+enum ENUM_STRATEGY {
+   STRAT_NONE = 0,
+   STRAT_CHECKLIST = 1,
+   STRAT_BREAKOUT_RANGE = 2,
+   STRAT_PULLBACK_EMA = 3,
+   STRAT_SUPERTREND = 4,
+   STRAT_RETEST_SR = 5,
+   STRAT_SCALPING = 6
+};
+
+struct SStrategyPerformance {
+   ENUM_STRATEGY strategy;
+   int totalTrades;
+   int wins;
+   int losses;
+   double totalProfit;
+   double winRate;
+   double profitFactor;
+   bool enabled;
+   datetime lastTradeTime;
+   double weight;
+};
+
+struct STradeSignal {
+   bool valid;
+   bool isBuySignal;
+   double price;
+   double sl;
+   double tp;
+   ENUM_STRATEGY strategy;
+   string comment;
+};
+
+struct SSymbolStats {
+   string symbol;
+   int totalTrades;
+   int winTrades;
+   int lossTrades;
+   int todayTrades;
+   int todayWins;
+   int todayLosses;
+   double spreadSum;
+   int spreadCount;
+   double spreadMax;
+   double lastSpread;
+};
+
+struct StrategyStats {
+   string  Name;
+   bool    Enabled;
+   int     TotalTrades;
+   int     Wins;
+   int     Losses;
+   double  Profit;
+   double  WinRate;
+   color   StatusColor;
+};
+
+struct DailyStats {
+   datetime Day;
+   double   Profit;
+   int      Trades;
+   double   MaxDrawdown;
+};
+
+// Variables globales
+double          g_LastEquity      = 0.0;
+double          g_LastBalance     = 0.0;
+double          g_ATRValue        = 0.0;
+string          g_SymbolGold1     = "GOLD";
+string          g_SymbolGold2     = "XAUUSD";
+bool            g_IsGold          = false;
+bool            ea_is_active      = true;
+bool            EnableSuperTrend  = true; // Variable globale modifiable
+
+StrategyStats strategies[];
+int strategies_total = 0;
+DailyStats day_stats[];
+
+// Objets globaux
+CTrade trade;
+CPositionInfo positionInfo;
+CHistoryOrderInfo historyOrder;
+CDealInfo dealInfo;
+int macdHandle;
+int rsiHandle;
+
+datetime lastPerformanceSaveTime = 0;
+const int PERFORMANCE_SAVE_INTERVAL = 3600;
+
+SStrategyPerformance strategyPerformance[STRATEGY_COUNT];
+SSymbolStats stats[MAX_SYMBOLS];
+int symbolCount = 0;
+
+datetime lastTradeTime = 0;
+ulong lastTradeTicket = 0;
+
+// Début de la Classes principales ///////////////////
+class CRiskManager {
+private:
+   double maxDailyLossPercent;
+   double maxLossPercent;
+   int maxConsecutiveLosses;
+   int pauseAfterLosses;
+   int pauseDurationMinutes;
+   int consecutiveLosses;
+   datetime pauseUntil;
+   datetime lastTradeTime;
+
+public:
+   // Constructeur
+   CRiskManager(double dailyLossPct, double lossPct, int maxConsLoss, int pauseLoss, int pauseMin)
+      : maxDailyLossPercent(dailyLossPct),
+        maxLossPercent(lossPct),
+        maxConsecutiveLosses(maxConsLoss),
+        pauseAfterLosses(pauseLoss),
+        pauseDurationMinutes(pauseMin),
+        consecutiveLosses(0),
+        pauseUntil(0),
+        lastTradeTime(0) {}
+
+   // ✅ Autorisation de trader (pauses, pertes, etc.)
+   bool IsTradeAllowed() const {
+      if (pauseUntil > TimeCurrent()) {
+         Print("⛔ Trading pause active until ", TimeToString(pauseUntil, TIME_MINUTES));
+         return false;
+      }
+
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if (balance <= 0) return false;
+
+      double dailyLoss = ((balance - equity) / balance) * 100.0;
+
+      if (dailyLoss >= maxDailyLossPercent) {
+         PrintFormat("❌ Daily loss limit exceeded: %.2f%% ≥ %.2f%%", dailyLoss, maxDailyLossPercent);
+         return false;
+      }
+
+      if (consecutiveLosses >= maxConsecutiveLosses) {
+         PrintFormat("❌ Consecutive losses limit reached: %d", consecutiveLosses);
+         return false;
+      }
+
+      return true;
+   }
+
+   // ✅ Mise à jour des pertes / pauses
+   void UpdateTradeResult(double profit) {
+      if (profit < 0) {
+         consecutiveLosses++;
+         if (consecutiveLosses >= pauseAfterLosses) {
+            pauseUntil = TimeCurrent() + pauseDurationMinutes * 60;
+            PrintFormat("🚫 Pausing trading for %d minutes after %d losses", pauseDurationMinutes, consecutiveLosses);
+         }
+      } else {
+         consecutiveLosses = 0;
+      }
+      lastTradeTime = TimeCurrent();
+   }
+
+   // ✅ Calcul de la taille de lot
+   double CalculatePositionSize(double entry, double stopLoss) const {
+      if (entry <= 0 || stopLoss <= 0) {
+         Print("❗ Invalid price or SL for lot calculation");
+         return 0.0;
+      }
+
+      double stopDistance = MathAbs(entry - stopLoss);
+      if (stopDistance < _Point) {
+         Print("❗ SL too close to entry");
+         return 0.0;
+      }
+
+      double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * maxLossPercent / 100.0;
+
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+      if (tickValue == 0 || tickSize == 0 || lotStep == 0) {
+         Print("❗ Market info unavailable (tick size/value)");
+         return 0.0;
+      }
+
+      double costPerLot = stopDistance / tickSize * tickValue;
+      if (costPerLot <= 0) {
+         Print("❗ Invalid stop distance or tick values");
+         return 0.0;
+      }
+
+      double rawLots = riskAmount / costPerLot;
+      double roundedLots = MathFloor(rawLots / lotStep) * lotStep;
+
+      // Sécurité : appliquer les limites autorisées
+      roundedLots = MathMax(minLot, MathMin(roundedLots, maxLot));
+
+      if (roundedLots < minLot) {
+         PrintFormat("❗ Calculated lot size %.2f is below min allowed %.2f", roundedLots, minLot);
+         return 0.0;
+      }
+
+      return roundedLots;
+   }
+
+   // ✅ Compter les positions ouvertes (même MagicNumber)
+   int GetOpenPositionsCount(string symbol) const {
+      int count = 0;
+      for (int i = 0; i < PositionsTotal(); i++) {
+         ulong ticket = PositionGetTicket(i);
+         if (PositionSelectByTicket(ticket)) {
+            string sym = PositionGetString(POSITION_SYMBOL);
+            int magic = (int)PositionGetInteger(POSITION_MAGIC);
+            if (sym == symbol && magic == MagicNumber) {
+               count++;
+            }
+         }
+      }
+      return count;
+   }
+
+   // ✅ Délai entre trades
+   bool CheckMinTimeBetweenTrades(int minMinutes) const {
+      if (lastTradeTime == 0) return true;
+      return (TimeCurrent() - lastTradeTime) >= (minMinutes * 60);
+   }
+
+   // ✅ Réinitialiser les pertes consécutives
+   void ResetConsecutiveLosses() {
+      consecutiveLosses = 0;
+      pauseUntil = 0;
+      Print("✅ Consecutive losses reset");
+   }
+};
+
+///////////////////// FIN DE LA CLASSE /////////////////////////
+
+// Début de la Classe CStrategyManager
+class CStrategyManager {
+public: // Changement de private à public pour certains membres
+   int macdHandle;
+   int rsiHandle;
+   int atrHandle;
+   int adxHandle, bbHandle;
+   int emaHandle, ema200Handle;
+   int superTrendHandle;
+   int checklistMacdHandle;
+
+   bool WaitForIndicatorData(int handle, string name, int timeout_ms = 3000) {
+      if(handle == INVALID_HANDLE) return false;
+      
+      uint start = GetTickCount();
+      while(GetTickCount() - start < timeout_ms) {
+         if(BarsCalculated(handle) > 100) return true;
+         Sleep(50);
+      }
+      Print(name, " - Timeout après ", timeout_ms, " ms");
+      return false;
+   }
+   
+   bool WaitForSuperTrendData(int handle, int timeout_ms = 800) {
+      if(handle == INVALID_HANDLE) return false;
+
+      int calculated = BarsCalculated(handle);
+      int chartBars = iBars(_Symbol, _Period);
+
+      if(calculated > 10 && (chartBars - calculated) < 10) {
+          return true;  // suffisant
+      }
+
+      uint start = GetTickCount();
+      while(GetTickCount() - start < timeout_ms) {
+          calculated = BarsCalculated(handle);
+          chartBars = iBars(_Symbol, _Period);
+          if(calculated > 10 && (chartBars - calculated) < 10)
+              return true;
+          Sleep(50);
+      }
+
+      Print("SuperTrend Timeout - BarsCalculated: ", calculated, ", Chart bars: ", chartBars);
+      return false;
+   }
+
+   bool InitIndicatorWithRetry(int &handle, int newHandle, string name, int max_retries = 3) {
+      int attempts = 0;
+      while(attempts < max_retries) {
+         handle = newHandle;
+         if(handle != INVALID_HANDLE) {
+            bool isSuperTrend = (name == "SuperTrend");
+            if((isSuperTrend && WaitForSuperTrendData(handle)) || 
+               (!isSuperTrend && WaitForIndicatorData(handle, name))) {
+               return true;
+            }
+         }
+         if(handle != INVALID_HANDLE) IndicatorRelease(handle);
+         Sleep(500);
+         attempts++;
+      }
+      Print("Échec d'initialisation de ", name, " après ", max_retries, " tentatives");
+      return false;
+   }
+
+   void ResetSuperTrendHandle() {
+      if(superTrendHandle != INVALID_HANDLE) {
+         IndicatorRelease(superTrendHandle);
+         superTrendHandle = INVALID_HANDLE;
+      }
+      superTrendHandle = iCustom(_Symbol, _Period, "SuperTrend", SuperTrend_ATRPeriod, SuperTrend_Multiplier);
+      if(superTrendHandle == INVALID_HANDLE) {
+         Print("CRITICAL: Impossible de réinitialiser SuperTrend!");
+      } else {
+         Print("SuperTrend réinitialisé avec handle: ", superTrendHandle);
+      }
+   }
+
+   // ✅ Accès au handle ATR depuis l'extérieur
+   int GetATRHandle() {
+      return atrHandle;
+   }
+
+   // 🔧 Méthodes d'initialisation
+   bool InitializeIndicators() {
+      ReleaseAllHandles();
+      
+      if(!InitIndicatorWithRetry(macdHandle, iMACD(_Symbol, _Period, 12, 26, 9, PRICE_CLOSE), "MACD")) return false;
+      if(!InitIndicatorWithRetry(checklistMacdHandle, iMACD(_Symbol, _Period, Checklist_MACD_Fast, Checklist_MACD_Slow, Checklist_MACD_Signal, PRICE_CLOSE), "Checklist MACD")) return false;
+      if(!InitIndicatorWithRetry(adxHandle, iADX(_Symbol, _Period, 14), "ADX")) return false;
+      if(!InitIndicatorWithRetry(atrHandle, iATR(_Symbol, _Period, 14), "ATR")) return false;
+      if(!InitIndicatorWithRetry(rsiHandle, iRSI(_Symbol, _Period, 14, PRICE_CLOSE), "RSI")) return false;
+      if(!InitIndicatorWithRetry(bbHandle, iBands(_Symbol, _Period, 20, 0, 2.0, PRICE_CLOSE), "Bollinger Bands")) return false;
+      if(!InitIndicatorWithRetry(emaHandle, iMA(_Symbol, _Period, 20, 0, MODE_EMA, PRICE_CLOSE), "EMA20")) return false;
+      if(!InitIndicatorWithRetry(ema200Handle, iMA(_Symbol, _Period, 200, 0, MODE_EMA, PRICE_CLOSE), "EMA200")) return false;
+
+      if(EnableSuperTrend) {
+         if(!InitIndicatorWithRetry(superTrendHandle, iCustom(_Symbol, _Period, "SuperTrend", SuperTrend_ATRPeriod, SuperTrend_Multiplier), "SuperTrend")) {
+            Print("Warning: SuperTrend initialization failed - strategy will be disabled");
+            EnableSuperTrend = false;
+         } else {
+            // Vérification supplémentaire pour SuperTrend
+            double testBuffer[1];
+            if(CopyBuffer(superTrendHandle, 0, 0, 1, testBuffer) <= 0 || !MathIsValidNumber(testBuffer[0]) || testBuffer[0] == EMPTY_VALUE) {
+               Print("⚠️ SuperTrend validation ignorée sur bougie 0 — on continue");
+            } else {
+               Print("✅ SuperTrend initialisé avec une valeur = ", testBuffer[0]);
+            }
+         }
+      }
+
+      Print("All indicators initialized successfully");
+      return AreIndicatorsReady();
+   }
+
+   bool CheckIndicators() {
+      if(macdHandle == INVALID_HANDLE || 
+         checklistMacdHandle == INVALID_HANDLE || 
+         adxHandle == INVALID_HANDLE || 
+         atrHandle == INVALID_HANDLE || 
+         rsiHandle == INVALID_HANDLE || 
+         bbHandle == INVALID_HANDLE || 
+         emaHandle == INVALID_HANDLE || 
+         ema200Handle == INVALID_HANDLE) {
+         Print("One or more indicator handles are invalid");
+         return false;
+      }
+      if(EnableSuperTrend && superTrendHandle == INVALID_HANDLE) {
+         Print("SuperTrend indicator is enabled but handle is invalid");
+         return false;
+      }
+      return true;
+   }
+
+   // 📉 Utilitaires
+   double GetCurrentDrawdown() {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      return (balance > 0) ? (balance - equity)/balance * 100 : 0;
+   }
+
+   bool IsHighImpactNewsNow() {
+      return false; // à implémenter si nécessaire
+   }
+
+   bool AreIndicatorsReady(bool verbose = true) {
+      string missing = "";
+      
+      if(!IsIndicatorReady(macdHandle)) missing += "MACD,";
+      if(!IsIndicatorReady(rsiHandle)) missing += "RSI,";
+      if(!IsIndicatorReady(atrHandle)) missing += "ATR,";
+      if(!IsIndicatorReady(adxHandle)) missing += "ADX,";
+      if(!IsIndicatorReady(bbHandle)) missing += "Bollinger Bands,";
+      if(!IsIndicatorReady(emaHandle)) missing += "EMA20,";
+      if(!IsIndicatorReady(ema200Handle)) missing += "EMA200,";
+      if(EnableSuperTrend && !IsIndicatorReady(superTrendHandle)) missing += "SuperTrend,";
+
+      if(missing != "" && verbose) 
+         Print("Indicateurs manquants: ", missing);
+
+      return (missing == "");
+   }
+
+   bool IsIndicatorReady(int handle, int min_bars = 100) {
+      if(handle == INVALID_HANDLE) return false;
+      
+      int calculated = BarsCalculated(handle);
+      if(calculated < min_bars) return false;
+      
+      // Vérification supplémentaire pour SuperTrend
+      if(handle == superTrendHandle) {
+         double testValue[1];
+         if(CopyBuffer(handle, 0, 0, 1, testValue) <= 0 || !MathIsValidNumber(testValue[0]) || testValue[0] == EMPTY_VALUE) {
+            Print("SuperTrend data invalid at pos 0 — vérification échouée");
+            return false;
+         }
+      }
+      
+      return true;
+   }
+
+   void ReleaseAllHandles() {
+      if(macdHandle != INVALID_HANDLE)       { IndicatorRelease(macdHandle); macdHandle = INVALID_HANDLE; }
+      if(rsiHandle != INVALID_HANDLE)        { IndicatorRelease(rsiHandle); rsiHandle = INVALID_HANDLE; }
+      if(atrHandle != INVALID_HANDLE)        { IndicatorRelease(atrHandle); atrHandle = INVALID_HANDLE; }
+      if(adxHandle != INVALID_HANDLE)        { IndicatorRelease(adxHandle); adxHandle = INVALID_HANDLE; }
+      if(bbHandle != INVALID_HANDLE)         { IndicatorRelease(bbHandle); bbHandle = INVALID_HANDLE; }
+      if(emaHandle != INVALID_HANDLE)        { IndicatorRelease(emaHandle); emaHandle = INVALID_HANDLE; }
+      if(ema200Handle != INVALID_HANDLE)     { IndicatorRelease(ema200Handle); ema200Handle = INVALID_HANDLE; }
+      if(superTrendHandle != INVALID_HANDLE) { IndicatorRelease(superTrendHandle); superTrendHandle = INVALID_HANDLE; }
+   }
+
+   // 📈 Signaux stratégiques
+   bool ChecklistStrategySignal(STradeSignal &signal);
+   
+   bool DetectSuperTrendSignal(STradeSignal &signal) {
+      signal.valid = false;
+      
+      if(!EnableSuperTrend || superTrendHandle == INVALID_HANDLE) {
+         return false;
+      }
+
+      // Double vérification des données
+      if(!WaitForSuperTrendData(superTrendHandle)) {
+         ResetSuperTrendHandle();
+         if(!WaitForSuperTrendData(superTrendHandle)) {
+            return false;
+         }
+      }
+
+      double supertrend[3];
+      bool superTrendOk = false;
+      for(int start = 0; start <= 2; start++) {
+         if(SafeCopyBuffer(superTrendHandle, 0, start, 3, supertrend, "SuperTrend")) {
+            superTrendOk = true;
+            break;
+         }
+      }
+
+      if(!superTrendOk) {
+         Print("⚠️ SuperTrend indisponible après plusieurs tentatives — skip propre");
+         return false;
+      }
+
+      // Validation rigoureuse des valeurs
+      for(int i = 0; i < 3; i++) {
+         if(supertrend[i] == EMPTY_VALUE || !MathIsValidNumber(supertrend[i]) || 
+            supertrend[i] > 1e300 || supertrend[i] < -1e300) {
+            Print("Invalid SuperTrend value at ", i, ": ", supertrend[i]);
+            ResetSuperTrendHandle();
+            return false;
+         }
+      }
+
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ema200 = iMA(_Symbol, _Period, 200, 0, MODE_EMA, PRICE_CLOSE);
+      if(supertrend[1] < price && ema200 < price) {
+         if(supertrend[2] < iClose(_Symbol, _Period, 2)) {
+            signal.isBuySignal = true;
+            signal.price = price;
+            SetStopTp(signal, true);
+            signal.valid = true;
+            signal.comment = "SuperTrend BUY (Confirmed)";
+            signal.strategy = STRAT_SUPERTREND;
+            return true;
+         }
+      }
+      else if(supertrend[1] > price && ema200 > price) {
+         if(supertrend[2] > iClose(_Symbol, _Period, 2)) {
+            signal.isBuySignal = false;
+            signal.price = price;
+            SetStopTp(signal, false);
+            signal.valid = true;
+            signal.comment = "SuperTrend SELL (Confirmed)";
+            signal.strategy = STRAT_SUPERTREND;
+            return true;
+         }
+      }
+      
+      return false;
+   }
+   
+   bool DetectSRRetestSignal(STradeSignal &signal);
+   bool DetectBreakoutSignal(STradeSignal &signal);
+   bool DetectPullbackEMASignal(STradeSignal &signal);
+   bool DetectScalpingSignal(STradeSignal &signal);
+
+   // 🧾 Journalisation avancée
+   void LogSignalDetails(const STradeSignal &signal) {
+      double macd[1], signalLine[1], rsi[1];
+      if(CopyBuffer(macdHandle, MAIN_LINE, 0, 1, macd) == 1 &&
+         CopyBuffer(macdHandle, SIGNAL_LINE, 0, 1, signalLine) == 1 &&
+         CopyBuffer(rsiHandle, 0, 0, 1, rsi) == 1) {
+         PrintFormat("Signal details - Type: %s, Price: %.5f, SL: %.5f, TP: %.5f, MACD: %.5f, Signal: %.5f, RSI: %.2f",
+                     signal.isBuySignal ? "BUY" : "SELL",
+                     signal.price,
+                     signal.sl,
+                     signal.tp,
+                     macd[0],
+                     signalLine[0],
+                     rsi[0]);
+      }
+   }
+};
+
+// Classe CTradeManager
+class CTradeManager {
+private:
+   CRiskManager *riskManager;
+   CTrade trade;
+
+public:
+   // Constructeur
+   CTradeManager(CRiskManager *manager) : riskManager(manager) {
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.SetMarginMode();
+      trade.SetTypeFillingBySymbol(_Symbol);
+      trade.SetDeviationInPoints(Slippage);
+   }
+
+   // Exécute un trade basé sur un signal
+bool ExecuteTrade(const STradeSignal &signal) {
+   if(!signal.valid || !CanOpenNewPosition(_Symbol)) {
+      Print("Cannot execute trade - invalid signal or max positions reached");
+      return false;
+   }
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double market_price = signal.isBuySignal ? ask : bid;
+
+   double lots = riskManager.CalculatePositionSize(market_price, signal.sl);
+   if(lots <= 0) {
+      Print("Invalid lot size calculated: ", lots);
+      return false;
+   }
+
+   if(signal.sl <= 0 || signal.tp <= 0) {
+      Print("Invalid SL or TP: SL=", signal.sl, " TP=", signal.tp);
+      return false;
+   }
+
+   if(!ValidatePrices(market_price, signal.sl, signal.tp, signal.isBuySignal)) {
+      Print("SL/TP invalid for current market price");
+      return false;
+   }
+
+   PrintFormat("\xF0\x9F\x93\x8C Signal reçu : %s | Lots=%.2f | Prix=%.2f | SL=%.2f | TP=%.2f",
+               signal.isBuySignal ? "BUY" : "SELL",
+               lots, signal.price, signal.sl, signal.tp);
+
+   // Envoi sans SL/TP au départ pour contourner 4753
+   bool result = signal.isBuySignal ?
+                 trade.Buy(lots, _Symbol, 0, 0, 0, signal.comment) :
+                 trade.Sell(lots, _Symbol, 0, 0, 0, signal.comment);
+
+   if(result) {
+      ulong deal_ticket = trade.ResultDeal();
+      double profit = 0.0;
+      if(deal_ticket > 0) {
+         profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+      }
+
+      // ➡ Ajout SL/TP après ouverture
+      if(!trade.PositionModify(_Symbol, signal.sl, signal.tp)) {
+         Print("⚠️ Échec ajout SL/TP après ouverture : ", trade.ResultRetcodeDescription());
+      } else {
+         PrintFormat("✅ SL/TP appliqués après ouverture : SL=%.5f | TP=%.5f", signal.sl, signal.tp);
+      }
+
+      riskManager.UpdateTradeResult(profit);
+
+      if(EnableNotifications) {
+         string msg = StringFormat("New %s trade opened via %s. Lots: %.2f SL: %.5f TP: %.5f",
+                                   signal.isBuySignal ? "BUY" : "SELL",
+                                   EnumToString(signal.strategy),
+                                   lots, signal.sl, signal.tp);
+         Alert(_Symbol + " " + EnumToString(_Period) + ": " + msg);
+         if(EnableSound) PlaySound("alert.wav");
+      }
+      return true;
+   }
+
+   Print("Trade execution failed. Error: ", GetLastError());
+   return false;
+}
+
+//////////////// Fin de Execute trade //////////////
+
+
+   // Gère les positions ouvertes
+   void ManagePositions() {
+      for(int i = (int)PositionsTotal() - 1; i >= 0; i--) {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket)) {
+            string pos_symbol = PositionGetString(POSITION_SYMBOL);
+            int pos_magic = (int)PositionGetInteger(POSITION_MAGIC);
+
+            if(pos_symbol != _Symbol || pos_magic != MagicNumber) continue;
+
+            double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+            double tp = PositionGetDouble(POSITION_TP);
+            double sl = PositionGetDouble(POSITION_SL);
+            double volume = PositionGetDouble(POSITION_VOLUME);
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+            ManagePartialClose(ticket, type, entry, sl, volume);
+            ManageTrailingStop(ticket, type, entry, sl, tp);
+         }
+      }
+   }
+
+   // Ferme partiellement une position
+   void PartialClose(ulong ticket, double percentage) {
+      if(PositionSelectByTicket(ticket)) {
+         double vol = PositionGetDouble(POSITION_VOLUME);
+         double closeLots = MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), vol * percentage);
+         if(closeLots > 0) {
+            trade.PositionClosePartial(ticket, closeLots);
+         }
+      }
+   }
+
+   // Vérifie si une nouvelle position peut être ouverte
+   bool CanOpenNewPosition(string symbol) {
+      if(riskManager.GetOpenPositionsCount(symbol) >= MAX_POSITIONS_PER_SYMBOL) {
+         Print("Max positions (", MAX_POSITIONS_PER_SYMBOL, ") reached for ", symbol);
+         return false;
+      }
+
+      if(!riskManager.CheckMinTimeBetweenTrades(MinMinutesBetweenTrades)) {
+         Print("Minimum time between trades not reached");
+         return false;
+      }
+
+      return CheckSpreadConditions(symbol);
+   }
+
+   // Placeholder
+   void UpdateTrailingStop() {}
+
+private:
+   void ManagePartialClose(ulong ticket, ENUM_POSITION_TYPE type, double entry, double sl, double volume) {
+      if(volume < 0.2) return;
+
+      double stopDistance = MathAbs(entry - sl);
+      if(stopDistance <= 0) return;
+
+      double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                                                          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      double r = (type == POSITION_TYPE_BUY) ? (currentPrice - entry) / stopDistance :
+                                               (entry - currentPrice) / stopDistance;
+
+      if(r >= 1.0) {
+         PartialClose(ticket, 0.5);
+      }
+   }
+
+   void ManageTrailingStop(ulong ticket, ENUM_POSITION_TYPE type, double entry, double &sl, double tp) {
+      double atr = iATR(_Symbol, _Period, ATRPeriod);
+      double profit = PositionGetDouble(POSITION_PROFIT);
+
+      if(profit > atr * 100) {
+         double newSL = 0;
+         if(type == POSITION_TYPE_BUY) {
+            newSL = SymbolInfoDouble(_Symbol, SYMBOL_BID) - atr;
+            if(newSL > sl && newSL > entry) {
+               trade.PositionModify(ticket, newSL, tp);
+            }
+         } else {
+            newSL = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + atr;
+            if(newSL < sl && newSL < entry) {
+               trade.PositionModify(ticket, newSL, tp);
+            }
+         }
+      }
+   }
+
+   bool CheckSpreadConditions(string symbol) {
+      double spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD) * SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double maxSpread = 0;
+
+      if(symbol == "EURUSD") maxSpread = 1.5 * 0.0001;
+      else if(symbol == "USDJPY") maxSpread = 3.0 * 0.01;
+      else if(symbol == "EURGBP") maxSpread = 2.0 * 0.0001;
+      else if(symbol == "XAUUSD" || symbol == "GOLD") maxSpread = 5.0 * 0.01;
+      else if(symbol == "BTCUSD") maxSpread = 100.0;
+      else maxSpread = 12 * SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+      if(spread > maxSpread) {
+         PrintFormat("Spread too high for %s: %.1f pips (max: %.1f)", 
+                     symbol, spread / SymbolInfoDouble(symbol, SYMBOL_POINT), 
+                     maxSpread / SymbolInfoDouble(symbol, SYMBOL_POINT));
+         return false;
+      }
+
+      return true;
+   }
+
+   // ✅ Validation robuste des SL / TP pour toutes les paires
+bool ValidatePrices(double price, double sl, double tp, bool isBuy) {
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+    if (minStopLevel <= 0) minStopLevel = point * 2; // sécurité minimale
+
+    // Distance minimale : BTC et GOLD ont besoin de marges plus larges
+    double customMinDist = minStopLevel;
+    if (StringFind(_Symbol, "BTCUSD") >= 0) customMinDist = MathMax(minStopLevel, 100.0 * point);
+    else if (StringFind(_Symbol, "XAUUSD") >= 0 || StringFind(_Symbol, "GOLD") >= 0) customMinDist = MathMax(minStopLevel, 10.0 * point);
+
+    // Vérification basique
+    if (sl <= 0 || tp <= 0) {
+        PrintFormat("❌ SL/TP invalides (0 ou négatif): SL=%.5f TP=%.5f", sl, tp);
+        return false;
+    }
+
+    // BUY : SL doit être sous le prix, TP au-dessus
+    if (isBuy) {
+        if (sl >= price - customMinDist) {
+            PrintFormat("❌ SL trop proche / incohérent pour BUY : SL=%.5f prix=%.5f min=%.5f", sl, price, customMinDist);
+            return false;
+        }
+        if (tp <= price + customMinDist) {
+            PrintFormat("❌ TP trop proche / incohérent pour BUY : TP=%.5f prix=%.5f min=%.5f", tp, price, customMinDist);
+            return false;
+        }
+    }
+    // SELL : SL au-dessus, TP en-dessous
+    else {
+        if (sl <= price + customMinDist) {
+            PrintFormat("❌ SL trop proche / incohérent pour SELL : SL=%.5f prix=%.5f min=%.5f", sl, price, customMinDist);
+            return false;
+        }
+        if (tp >= price - customMinDist) {
+            PrintFormat("❌ TP trop proche / incohérent pour SELL : TP=%.5f prix=%.5f min=%.5f", tp, price, customMinDist);
+            return false;
+        }
+    }
+
+    // Protection contre des distances aberrantes
+    double maxReasonable = 10000 * point;
+    if (MathAbs(price - sl) > maxReasonable || MathAbs(tp - price) > maxReasonable) {
+        PrintFormat("❌ SL/TP trop éloignés : SL=%.5f TP=%.5f prix=%.5f", sl, tp, price);
+        return false;
+    }
+
+    return true;
+}
+
+};
+
+/////// FIN  DE LA CLASSE ///////
+
+// Instances globales
+CRiskManager riskManager(MaxDailyLossPercent, MaxLossPercent, MaxConsecutiveLosses, PauseAfterLosses, PauseDurationMinutes);
+CStrategyManager strategyManager;
+CTradeManager tradeManager(&riskManager);
+
+double GetATR(int period = 14) {
+   int handle = strategyManager.GetATRHandle();  // Handle ATR global
+   if(handle == INVALID_HANDLE) {
+      Print("❗ Handle ATR non initialisé !");
+      return 0.0;
+   }
+
+   double atr[2];
+   if(!SafeCopyBuffer(handle, 0, 0, 2, atr, "ATR")) {
+      Print("❗ Échec lecture ATR via SafeCopyBuffer.");
+      return 0.0;
+   }
+
+   return atr[0];
+}
+
+
+double CalcDynamicLot(double riskPercent) {
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double riskMoney  = AccountInfoDouble(ACCOUNT_BALANCE) * riskPercent / 100.0;
+   double stopLossPoints = 200;
+   double tickValue   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lotStep     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   double atr = GetATR(ATRPeriod);
+   if(atr > 0)
+      stopLossPoints = atr * 2 / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   double lot = riskMoney / (stopLossPoints * tickValue / SymbolInfoDouble(_Symbol, SYMBOL_POINT));
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathFloor(lot / lotStep) * lotStep;
+   return(lot);
+}
+
+color GetValueColor(double val, double good, double bad) {
+   if(val >= good)
+      return(clrLime);
+   if(val <= bad)
+      return(clrRed);
+   return(clrYellow);
+}
+
+string FormatSigned(double value, int digits=2) {
+   if(value >= 0.0)
+      return("+" + DoubleToString(value, digits));
+   return(DoubleToString(value, digits));
+}
+
+void RefreshStrategyStats() {
+   for(int i=0; i<strategies_total; i++) {
+      StrategyStats s = strategies[i];
+      if(s.TotalTrades > 0)
+         s.WinRate = 100.0 * s.Wins / s.TotalTrades;
+      else
+         s.WinRate = 0.0;
+      if(!s.Enabled)
+         s.StatusColor = clrSilver;
+      else if(s.WinRate >= 60.0)
+         s.StatusColor = clrDeepSkyBlue;
+      else if(s.WinRate >= 50.0)
+         s.StatusColor = clrLime;
+      else if(s.WinRate >= 40.0)
+         s.StatusColor = clrYellow;
+      else
+         s.StatusColor = clrRed;
+   }
+}
+
+void UpdateDailyStats() {
+   datetime today = DateOfDay(TimeCurrent());
+   int idx = -1;
+   for(int i=0; i<ArraySize(day_stats); i++) {
+      if(day_stats[i].Day == today) {
+         idx = i;
+         break;
+      }
+   }
+   if(idx == -1) {
+      ArrayResize(day_stats, ArraySize(day_stats)+1);
+      idx = ArraySize(day_stats)-1;
+      day_stats[idx].Day = today;
+      day_stats[idx].Profit = 0.0;
+      day_stats[idx].Trades = 0;
+      day_stats[idx].MaxDrawdown = 0.0;
+   }
+}
+
+datetime DateOfDay(datetime t) {
+   MqlDateTime str;
+   TimeToStruct(t, str);
+   str.hour = 0;
+   str.min = 0;
+   str.sec = 0;
+   return(StructToTime(str));
+}
+
+bool IsGold() {
+   return(StringFind(_Symbol, g_SymbolGold1) >= 0 || StringFind(_Symbol, g_SymbolGold2) >= 0);
+}
+
+bool DetectMarketAnomaly() {
+   double spread = (SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(spread > 10 * SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+      return(true);
+   return(false);
+}
+
+// Fonctions de signal
+bool CStrategyManager::ChecklistStrategySignal(STradeSignal &signal) {
+    double ema200[2], rsi[2], adx[2], atr[1], macdMain[2], macdSignal[2];
+    if(
+         !SafeCopyBuffer(ema200Handle, 0, 1, 2, ema200, "EMA200") ||
+    !SafeCopyBuffer(rsiHandle, 0, 1, 2, rsi, "RSI") ||
+    !SafeCopyBuffer(adxHandle, 0, 1, 2, adx, "ADX") ||
+    !SafeCopyBuffer(atrHandle, 0, 0, 1, atr, "ATR") ||
+    !SafeCopyBuffer(checklistMacdHandle, 0, 1, 2, macdMain, "MACD Main") ||
+    !SafeCopyBuffer(checklistMacdHandle, 1, 1, 2, macdSignal, "MACD Signal")
+    )
+    
+     {
+        Print("Failed to copy indicator buffers: ", GetLastError());
+        signal.valid = false;
+        return false;
+    }
+
+    double price      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double spread     = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double minATR     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * 10;
+    double maxSpread  = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 12;
+    double minADX     = 20;
+    double minRSI     = 40, maxRSI = 60;
+    MqlDateTime tm;
+    TimeToStruct(TimeCurrent(), tm);
+    int hour = tm.hour;
+
+    if(hour < 7 || hour > 21) {
+        signal.valid = false;
+        signal.comment = "Filtre horaire : hors session";
+        return false;
+    }
+
+    if(spread > maxSpread || atr[0] < minATR || adx[1] < minADX || rsi[1] < minRSI || rsi[1] > maxRSI) {
+        signal.valid = false;
+        signal.comment = "Filtre marché : spread/volatilité/ADX/RSI";
+        return false;
+    }
+
+    double maxAllowedDrawdown = 0.10;
+    double currentDrawdown    = GetCurrentDrawdown();
+    if(currentDrawdown > maxAllowedDrawdown) {
+        signal.valid = false;
+        signal.comment = "Drawdown trop important";
+        return false;
+    }
+
+    if(IsHighImpactNewsNow()) {
+        signal.valid = false;
+        signal.comment = "Filtre news : événement économique majeur";
+        return false;
+    }
+
+    int confirmations = 0;
+    STradeSignal st1, st2, st3, st4, st5;
+    if(EnableSuperTrend && DetectSuperTrendSignal(st1) && st1.valid) confirmations++;
+    if(DetectSRRetestSignal(st2)       && st2.valid) confirmations++;
+    if(DetectBreakoutSignal(st3)       && st3.valid) confirmations++;
+    if(DetectPullbackEMASignal(st4)    && st4.valid) confirmations++;
+    if(DetectScalpingSignal(st5)       && st5.valid) confirmations++;
+
+    if(confirmations < 2) {
+        signal.valid = false;
+        signal.comment = "Pas assez de signaux convergents";
+        return false;
+    }
+
+    int buyVotes  = (st1.isBuySignal ? 1 : 0) + (st2.isBuySignal ? 1 : 0) + 
+                   (st3.isBuySignal ? 1 : 0) + (st4.isBuySignal ? 1 : 0) + 
+                   (st5.isBuySignal ? 1 : 0);
+    int sellVotes = 5 - buyVotes;
+    signal.isBuySignal = (buyVotes > sellVotes);
+    signal.price = price;
+    SetStopTp(signal, signal.isBuySignal);
+    signal.valid = true;
+    signal.comment = StringFormat("ChecklistStrategy (%d confirmations, EMA/ADX/ATR/RSI/MACD/Spread/Drawdown/News OK)", confirmations);
+    return true;
+}
+
+bool CStrategyManager::DetectSRRetestSignal(STradeSignal &signal) {
+    double srLevels[50];
+    int nbLevels = LoadSRLevels(srLevels);
+    if(nbLevels == 0) {
+        signal.valid = false;
+        return false;
+    }
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ema200[1];
+    if(!SafeCopyBuffer(ema200Handle, 0, 0, 1, ema200, "EMA200")) {
+        signal.valid = false;
+        return false;
+    }
+    
+    double tolerance = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 20;
+    for(int i = 0; i < nbLevels; i++) {
+        if(MathAbs(price - srLevels[i]) < tolerance && price > ema200[0]) {
+            signal.isBuySignal = true;
+            signal.price = price;
+            SetStopTp(signal, true);
+            signal.valid = true;
+            signal.comment = "SR Retest BUY";
+            return true;
+        }
+        
+        if(MathAbs(price - srLevels[i]) < tolerance && price < ema200[0]) {
+            signal.isBuySignal = false;
+            signal.price = price;
+            SetStopTp(signal, false);
+            signal.valid = true;
+            signal.comment = "SR Retest SELL";
+            return true;
+        }
+    }
+    
+    signal.valid = false;
+    return false;
+}
+
+bool CStrategyManager::DetectBreakoutSignal(STradeSignal &signal) {
+    int rangeLookback = 20;
+    double highestHigh = iHigh(_Symbol, _Period, 1);
+    double lowestLow = iLow(_Symbol, _Period, 1);
+
+    for(int i = 2; i <= rangeLookback+1; i++) {
+        double high = iHigh(_Symbol, _Period, i);
+        double low = iLow(_Symbol, _Period, i);
+        if(high > highestHigh) highestHigh = high;
+        if(low < lowestLow) lowestLow = low;
+    }
+
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ema200[1];
+    if(!SafeCopyBuffer(ema200Handle, 0, 0, 1, ema200, "EMA200")) {
+        signal.valid = false;
+        return false;
+    }
+
+    if(price > highestHigh && price > ema200[0]) {
+        signal.isBuySignal = true;
+        signal.price = price;
+        SetStopTp(signal, true);
+        signal.valid = true;
+        signal.comment = "Breakout BUY";
+        return true;
+    }
+    
+    if(price < lowestLow && price < ema200[0]) {
+        signal.isBuySignal = false;
+        signal.price = price;
+        SetStopTp(signal, false);
+        signal.valid = true;
+        signal.comment = "Breakout SELL";
+        return true;
+    }
+    
+    signal.valid = false;
+    return false;
+}
+
+bool CStrategyManager::DetectPullbackEMASignal(STradeSignal &signal) {
+    double ema20[2], ema200[2], rsi[2], adx[2];
+    if(CopyBuffer(emaHandle, 0, 1, 2, ema20) < 2 ||
+       CopyBuffer(ema200Handle, 0, 1, 2, ema200) < 2 ||
+       CopyBuffer(rsiHandle, 0, 1, 2, rsi) < 2 ||
+       CopyBuffer(adxHandle, 0, 1, 2, adx) < 2) {
+        Print("Failed to copy indicator buffers: ", GetLastError());
+        signal.valid = false;
+        return false;
+    }
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double tolerance = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+
+    if(price > ema200[1] && MathAbs(price - ema20[1]) < tolerance && ema20[1] > ema200[1]) {
+        double prevClose = iClose(_Symbol, _Period, 1);
+        if(prevClose < ema20[1] && adx[1] > 20 && rsi[1] > 40) {
+            signal.isBuySignal = true;
+            signal.price = price;
+            SetStopTp(signal, true);
+            signal.valid = true;
+            signal.comment = "Pullback EMA BUY (RSI/ADX OK)";
+            return true;
+        }
+    }
+
+    if(price < ema200[1] && MathAbs(price - ema20[1]) < tolerance && ema20[1] < ema200[1]) {
+        double prevClose = iClose(_Symbol, _Period, 1);
+        if(prevClose > ema20[1] && adx[1] > 20 && rsi[1] < 60) {
+            signal.isBuySignal = false;
+            signal.price = price;
+            SetStopTp(signal, false);
+            signal.valid = true;
+            signal.comment = "Pullback EMA SELL (RSI/ADX OK)";
+            return true;
+        }
+    }
+    
+    signal.valid = false;
+    return false;
+}
+
+bool CStrategyManager::DetectScalpingSignal(STradeSignal &signal) {
+    double ema20[2], ema200[2], rsi[2], adx[2], atr[1];
+    if(CopyBuffer(emaHandle, 0, 1, 2, ema20) < 2 ||
+       CopyBuffer(ema200Handle, 0, 1, 2, ema200) < 2 ||
+       CopyBuffer(rsiHandle, 0, 1, 2, rsi) < 2 ||
+       CopyBuffer(adxHandle, 0, 1, 2, adx) < 2 ||
+       CopyBuffer(atrHandle, 0, 0, 1, atr) < 1) {
+        Print("Failed to copy indicator buffers: ", GetLastError());
+        signal.valid = false;
+        return false;
+    }
+
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double minATR = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 8;
+    double maxSpread = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 12;
+    double minADX = 18;
+    double minMicroPullback = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 2;
+
+    if(ema20[1] > ema200[1] && price > ema20[1] && rsi[1] > 35 && rsi[1] < 65 && 
+       adx[1] > minADX && atr[0] > minATR && spread < maxSpread && 
+       (price - ema20[1]) < minMicroPullback) {
+        signal.isBuySignal = true;
+        signal.price = price;
+        SetStopTp(signal, true);
+        signal.valid = true;
+        signal.comment = "Scalping BUY (EMA/RSI/ADX/ATR/SPREAD)";
+        return true;
+    }
+
+    if(ema20[1] < ema200[1] && price < ema20[1] && rsi[1] > 35 && rsi[1] < 65 && 
+       adx[1] > minADX && atr[0] > minATR && spread < maxSpread && 
+       (ema20[1] - price) < minMicroPullback) {
+        signal.isBuySignal = false;
+        signal.price = price;
+        SetStopTp(signal, false);
+        signal.valid = true;
+        signal.comment = "Scalping SELL (EMA/RSI/ADX/ATR/SPREAD)";
+        return true;
+    }
+
+    signal.valid = false;
+    return false;
+}
+
+// Fonctions de gestion des niveaux de support/résistance
+int LoadSRLevels(double &levels[]) {
+   ArrayResize(levels, 0);
+   int lookback = 100;
+   int bars = (int)Bars(_Symbol, _Period);
+   if(bars < lookback) lookback = bars;
+   
+   for(int i = 3; i < lookback-3; i++) {
+      double high1 = iHigh(_Symbol, _Period, i+1);
+      double high2 = iHigh(_Symbol, _Period, i);
+      double high3 = iHigh(_Symbol, _Period, i-1);
+      
+      if(high2 > high1 && high2 > high3) {
+         ArrayResize(levels, ArraySize(levels)+1);
+         levels[ArraySize(levels)-1] = high2;
+      }
+      
+      double low1 = iLow(_Symbol, _Period, i+1);
+      double low2 = iLow(_Symbol, _Period, i);
+      double low3 = iLow(_Symbol, _Period, i-1);
+      
+      if(low2 < low1 && low2 < low3) {
+         ArrayResize(levels, ArraySize(levels)+1);
+         levels[ArraySize(levels)-1] = low2;
+      }
+   }
+   
+   for(int i = 0; i < ArraySize(levels); i++) {
+      for(int j = i+1; j < ArraySize(levels); j++) {
+         if(MathAbs(levels[i] - levels[j]) < 10*_Point) {
+            levels[i] = (levels[i] + levels[j]) / 2;
+            for(int k = j; k < ArraySize(levels)-1; k++) {
+               levels[k] = levels[k+1];
+            }
+            ArrayResize(levels, ArraySize(levels)-1);
+            j--;
+         }
+      }
+   }
+   
+   return ArraySize(levels);
+}
+
+////// Fonction Validate Price ////
+bool ValidatePrices(double price, double sl, double tp, bool isBuy) {
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+    if (minStopLevel <= 0) minStopLevel = point * 2;
+
+    if (sl <= 0 || tp <= 0) return false;
+
+    if (isBuy) {
+        if (!(sl < price - minStopLevel && tp > price + minStopLevel)) {
+            PrintFormat("SL/TP incohérents pour BUY : SL=%.5f prix=%.5f TP=%.5f", sl, price, tp);
+            return false;
+        }
+    } else {
+        if (!(sl > price + minStopLevel && tp < price - minStopLevel)) {
+            PrintFormat("SL/TP incohérents pour SELL : SL=%.5f prix=%.5f TP=%.5f", sl, price, tp);
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// Fonction pour définir SL/TP
+// Calcule SL/TP avec validation immédiate
+void SetStopTp(STradeSignal &signal, bool isBuy) {
+    double atr = GetATR(ATRPeriod);
+    if (atr <= 0) {
+        Print("ATR invalide : ", atr);
+        signal.valid = false;
+        return;
+    }
+
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double minStopLevelPoints = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    double minStopLevel = minStopLevelPoints * point;
+    if (minStopLevel <= 0) minStopLevel = point * 2;
+
+    PrintFormat("DEBUG: SYMBOL_TRADE_STOPS_LEVEL=%d -> minStopLevel=%.5f", minStopLevelPoints, minStopLevel);
+
+    double stopDistance = MathMax(atr * 1.5, minStopLevel * 2);
+    double maxDistance = atr * 4.0; // Distance max raisonnable
+    double ratio = 2.0;
+    double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    // Limiter stopDistance à maxDistance
+    stopDistance = MathMin(stopDistance, maxDistance);
+
+    if (isBuy) {
+        signal.sl = price - stopDistance;
+        signal.tp = price + stopDistance * ratio;
+    } else {
+        signal.sl = price + stopDistance;
+        signal.tp = price - stopDistance * ratio;
+    }
+
+    PrintFormat("SL/TP final => SL=%.5f | TP=%.5f | distance=%.5f", signal.sl, signal.tp, stopDistance);
+
+    // Vérification finale
+    if (!ValidatePrices(price, signal.sl, signal.tp, isBuy)) {
+        Print("SL/TP invalides après calcul. Signal abandonné.");
+        signal.valid = false;
+    } else {
+        signal.valid = true;
+    }
+}
+
+bool OpenTrade(const STradeSignal &signal) {
+   if(!signal.valid) return false;
+   if(!ValidateTrade(signal)) return false;
+   return tradeManager.ExecuteTrade(signal);
+}
+
+bool ValidateTrade(const STradeSignal &signal) {
+   if(!signal.valid) return false;
+   
+   double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double minStop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   
+   if((signal.isBuySignal && (signal.sl >= signal.price || signal.tp <= signal.price)) ||
+      (!signal.isBuySignal && (signal.sl <= signal.price || signal.tp >= signal.price))) {
+      return false;
+   }
+   
+   return (spread < (_Symbol=="USDJPY" ? 0.02 : 0.0015));
+}
+
+bool CheckTradingConditions(STradeSignal &signal) {
+   if(!strategyManager.CheckIndicators()) return false;
+   if(!riskManager.IsTradeAllowed()) return false;
+
+   int indices[STRATEGY_COUNT];
+   for(int i = 0; i < STRATEGY_COUNT; i++)
+      indices[i] = i;
+
+   for(int i = 0; i < STRATEGY_COUNT - 1; i++) {
+      for(int j = i + 1; j < STRATEGY_COUNT; j++) {
+         if(strategyPerformance[indices[j]].weight > strategyPerformance[indices[i]].weight) {
+            int temp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = temp;
+         }
+      }
+   }
+
+   for(int k = 0; k < STRATEGY_COUNT; k++) {
+      int i = indices[k];
+      if(!strategyPerformance[i].enabled)
+         continue;
+
+      ENUM_STRATEGY strat = strategyPerformance[i].strategy;
+
+      switch(strat) {
+         case STRAT_CHECKLIST:
+            if(strategyManager.ChecklistStrategySignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+
+         case STRAT_SUPERTREND:
+            if(strategyManager.DetectSuperTrendSignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+
+         case STRAT_BREAKOUT_RANGE:
+            if(strategyManager.DetectBreakoutSignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+
+         case STRAT_PULLBACK_EMA:
+            if(strategyManager.DetectPullbackEMASignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+
+         case STRAT_RETEST_SR:
+            if(strategyManager.DetectSRRetestSignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+
+         case STRAT_SCALPING:
+            if(strategyManager.DetectScalpingSignal(signal)) {
+               signal.strategy = strat;
+               signal.valid = true;
+               return true;
+            }
+            break;
+      }
+   }
+
+   signal.valid = false;
+   return false;
+}
+
+// Gestion des stratégies
+void UpdateStrategyWeights() {
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      if(strategyPerformance[i].totalTrades < 5) continue;
+      
+      double recentWinRate = strategyPerformance[i].wins / (double)MathMax(20, strategyPerformance[i].totalTrades) * 100.0;
+      double mediumWinRate = strategyPerformance[i].wins / (double)MathMax(100, strategyPerformance[i].totalTrades) * 100.0;
+      
+      double atr = iATR(_Symbol, _Period, 14);
+      double volatilityFactor = (atr > 0.0005) ? 1.2 : (atr < 0.0002) ? 0.8 : 1.0;
+      
+      strategyPerformance[i].weight = recentWinRate * 0.5 + mediumWinRate * 0.3 + volatilityFactor * 0.2;
+   }
+}
+
+void AutoManageStrategies() {
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      if(strategyPerformance[i].totalTrades < MinTradesToDisable) continue;
+      
+      strategyPerformance[i].winRate = (double)strategyPerformance[i].wins / strategyPerformance[i].totalTrades * 100.0;
+      
+      if(strategyPerformance[i].winRate < MinWinRateToDisable) {
+         strategyPerformance[i].enabled = false;
+         strategyPerformance[i].lastTradeTime = TimeCurrent();
+         if(EnableNotifications) {
+            Alert(_Symbol + " " + EnumToString(_Period) + ": Strategy Disabled: " + EnumToString(strategyPerformance[i].strategy) + 
+                            " (Win Rate: " + DoubleToString(strategyPerformance[i].winRate, 1) + "%)");
+         }
+      }
+      
+      if(!strategyPerformance[i].enabled && 
+         TimeCurrent() - strategyPerformance[i].lastTradeTime > ReEnableAfterHours * 3600) {
+         strategyPerformance[i].enabled = true;
+         if(EnableNotifications) {
+            Alert(_Symbol + " " + EnumToString(_Period) + ": Strategy Re-enabled: " + EnumToString(strategyPerformance[i].strategy));
+         }
+      }
+   }
+}
+
+void LoadStrategyPerformance() {
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      string prefix = "STRAT_" + EnumToString(strategyPerformance[i].strategy) + "_";
+      strategyPerformance[i].wins = (int)GlobalVariableGet(prefix + "WINS");
+      strategyPerformance[i].losses = (int)GlobalVariableGet(prefix + "LOSSES");
+      strategyPerformance[i].totalTrades = (int)GlobalVariableGet(prefix + "TOTAL");
+      strategyPerformance[i].totalProfit = GlobalVariableGet(prefix + "PROFIT");
+      strategyPerformance[i].lastTradeTime = (datetime)GlobalVariableGet(prefix + "LAST_TIME");
+   }
+}
+
+void SaveStrategyPerformance() {
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      string prefix = "STRAT_" + EnumToString(strategyPerformance[i].strategy) + "_";
+      GlobalVariableSet(prefix + "WINS", strategyPerformance[i].wins);
+      GlobalVariableSet(prefix + "LOSSES", strategyPerformance[i].losses);
+      GlobalVariableSet(prefix + "TOTAL", strategyPerformance[i].totalTrades);
+      GlobalVariableSet(prefix + "PROFIT", strategyPerformance[i].totalProfit);
+      GlobalVariableSet(prefix + "LAST_TIME", (double)strategyPerformance[i].lastTradeTime);
+   }
+}
+
+// Fonctions du dashboard
+void DrawProgressBar(string name, int x, int y, double percent, color clrPositive, color clrNegative) {
+    int width = 150;
+    int height = 15;
+    
+    ObjectCreate(0, name+"_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, name+"_BG", OBJPROP_BACK, true);
+    
+    int progressWidth = (int)(width * percent / 100.0);
+    ObjectCreate(0, name+"_FG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_XSIZE, progressWidth);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_COLOR, percent >= 50 ? clrPositive : clrNegative);
+    ObjectSetInteger(0, name+"_FG", OBJPROP_BACK, false);
+}
+
+void CreateButton(string name, string text, int x, int y, int width, int height, color bgColor) {
+    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, bgColor);
+    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+    
+    ObjectCreate(0, name+"_TXT", OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name+"_TXT", OBJPROP_XDISTANCE, x + width/2 - StringLen(text)*3);
+    ObjectSetInteger(0, name+"_TXT", OBJPROP_YDISTANCE, y + height/2 - 8);
+    ObjectSetInteger(0, name+"_TXT", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, name+"_TXT", OBJPROP_FONTSIZE, 10);
+    ObjectSetString(0, name+"_TXT", OBJPROP_TEXT, text);
+}
+
+void DrawDashboardBackground(int x, int y, int width, int height) {
+   string bgName = "DASHBOARD_BG";
+   ObjectDelete(0, bgName);
+   ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, bgName, OBJPROP_CORNER, 0);
+   ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, bgName, OBJPROP_COLOR, C'10,20,40');
+   ObjectSetInteger(0, bgName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
+}
+
+void UpdateDashboard() {
+   DeleteDashboard();
+
+   int x = DashboardPosX;
+   int y = DashboardPosY;
+
+   ObjectCreate(0, "DASHBOARD_PANEL", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_XSIZE, DashboardWidth);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_YSIZE, DashboardHeight + 150);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_CORNER, 0);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_COLOR, C'30,30,30');
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_BACK, true);
+   ObjectSetInteger(0, "DASHBOARD_PANEL", OBJPROP_SELECTABLE, false);
+
+   y += 15;
+   int fontSize = 12;
+
+   string header = "PAIR: " + _Symbol + " | TF: " + EnumToString(_Period);
+   DisplayLabel("DASHBOARD_PAIR_TF", header, x + 15, y, clrGold, fontSize);
+   y += 20;
+
+   string strategy = "STRATEGY: " + LastStrategyUsed();
+   DisplayLabel("DASHBOARD_STRATEGY", strategy, x + 15, y, clrWhite, fontSize);
+   y += 20;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   DisplayLabel("DASHBOARD_BALANCE", "BALANCE: " + DoubleToString(balance, 2), x + 15, y, clrWhite, fontSize);
+   y += 20;
+   DisplayLabel("DASHBOARD_EQUITY", "EQUITY: " + DoubleToString(equity, 2), x + 15, y, clrWhite, fontSize);
+   y += 20;
+
+   double profitToday = GetDailyProfit();
+   color profitColor = profitToday >= 0 ? clrLime : clrOrange;
+   DisplayLabel("DASHBOARD_PROFIT_DAY", "DAILY PROFIT: " + FormatSigned(profitToday, 2), x + 15, y, profitColor, fontSize, true);
+   y += 20;
+
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+   DisplayLabel("DASHBOARD_SPREAD", "CURRENT SPREAD: " + DoubleToString(spread, Digits()), x + 15, y, clrWhite, fontSize);
+   y += 20;
+
+   y += 10;
+   DisplayLabel("DASHBOARD_SEPARATOR", "----------- DAILY STATISTICS -----------", x + 15, y, clrAqua, fontSize);
+   y += 20;
+
+   int totalTradesToday, winTradesToday, lossTradesToday;
+   GetTodayStats(totalTradesToday, winTradesToday, lossTradesToday);
+
+   DisplayLabel("DASHBOARD_TODAY_TRADES", "TOTAL TRADES TODAY: " + IntegerToString(totalTradesToday), x + 15, y, clrWhite, fontSize);
+   y += 20;
+
+   DisplayLabel("DASHBOARD_TODAY_WINS", "WINS: " + IntegerToString(winTradesToday) + " | LOSSES: " + IntegerToString(lossTradesToday), x + 15, y, clrWhite, fontSize);
+   y += 20;
+
+   double plToday = GetDailyProfit();
+   double winRateToday = totalTradesToday > 0 ? 100.0 * winTradesToday / totalTradesToday : 0.0;
+   DisplayLabel("DASHBOARD_TODAY_PL", "P/L TODAY: " + FormatSigned(plToday, 2), x + 15, y, plToday >= 0 ? clrLime : clrOrange, fontSize, true);
+   y += 20;
+
+   DrawProgressBar("WINRATE_BAR", x + 15, y, winRateToday, clrGreen, clrRed);
+   DisplayLabel("DASHBOARD_WINRATE", "WIN RATE TODAY: " + DoubleToString(winRateToday, 1) + "%", x + 220, y, clrYellow, fontSize);
+   y += 30;
+
+   string status = ea_is_active ? "ACTIVE" : "PAUSED";
+   color statusColor = ea_is_active ? clrLime : clrRed;
+   DisplayLabel("DASHBOARD_STATUS", "STATUS: " + status, x + 15, y, statusColor, 14, true);
+   y += 30;
+}
+
+void DeleteDashboard() {
+   ObjectDelete(0, "DASHBOARD_PANEL");
+
+   string elements[] = {
+      "DASHBOARD_PAIR_TF",
+      "DASHBOARD_STRATEGY",
+      "DASHBOARD_BALANCE",
+      "DASHBOARD_EQUITY",
+      "DASHBOARD_PROFIT_DAY",
+      "DASHBOARD_SPREAD",
+      "DASHBOARD_SEPARATOR",
+      "DASHBOARD_TODAY_TRADES",
+      "DASHBOARD_TODAY_WINS",
+      "DASHBOARD_TODAY_PL",
+      "WINRATE_BAR_BG",
+      "WINRATE_BAR_FG",
+      "DASHBOARD_WINRATE",
+      "DASHBOARD_STATUS",
+      "DASHBOARD_TOGGLE",
+      "DASHBOARD_TOGGLE_TXT",
+      "DASHBOARD_CLOSE",
+      "DASHBOARD_CLOSE_TXT"
+   };
+
+   for(int i = 0; i < ArraySize(elements); i++)
+      ObjectDelete(0, elements[i]);
+}
+
+void DisplayLabel(string name, string text, int x, int y, color txtColor, int size, bool bold=false) {
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, txtColor);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, 0);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+string LastStrategyUsed() {
+   if(PositionSelect(_Symbol))
+      return PositionGetString(POSITION_COMMENT);
+   return "No Active Trade";
+}
+
+void GetTodayStats(int &totalTrades, int &winTrades, int &lossTrades) {
+   totalTrades = 0;
+   winTrades = 0;
+   lossTrades = 0;
+
+   datetime today = DateOfDay(TimeCurrent());
+   int deals = HistoryDealsTotal();
+
+   for(int i = deals - 1; i >= 0; i--) {
+      ulong ticket = HistoryDealGetTicket(i);
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(dealTime < today)
+         break;
+
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol) {
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         totalTrades++;
+         if(profit > 0) winTrades++;
+         else if(profit < 0) lossTrades++;
+      }
+   }
+}
+
+double GetDailyProfit() {
+   double profitToday = 0.0;
+   datetime today = DateOfDay(TimeCurrent());
+   int deals = HistoryDealsTotal();
+
+   for(int i = deals - 1; i >= 0; i--) {
+      ulong ticket = HistoryDealGetTicket(i);
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(dealTime < today)
+         break;
+
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol)
+         profitToday += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+   }
+   return profitToday;
+}
+
+double CalculateWinRate() {
+   int totalTrades = 0;
+   int winningTrades = 0;
+
+   int totalHistory = HistoryDealsTotal();
+   for(int i = totalHistory - 1; i >= 0; i--) {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket != 0) {
+         double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+         if(profit != 0.0) {
+            totalTrades++;
+            if(profit > 0.0)
+               winningTrades++;
+         }
+      }
+   }
+
+   if(totalTrades == 0)
+      return 0.0;
+
+   return (double)winningTrades / totalTrades * 100.0;
+}
+
+// Initialisation et gestion des événements
+void InitGlobalVars() {
+   g_LastEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_LastBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_ATRValue    = 0.0;
+}
+
+void CheckGoldSymbol() {
+   g_IsGold = (StringFind(_Symbol, g_SymbolGold1) >= 0 || StringFind(_Symbol, g_SymbolGold2) >= 0);
+}
+
+void InitializeStrategies() {
+   strategies_total = 0;
+   ArrayResize(strategies, STRATEGY_COUNT);
+
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      StrategyStats s;
+      s.Enabled = true;
+      s.TotalTrades = 0;
+      s.Wins = 0;
+      s.Losses = 0;
+      s.Profit = 0.0;
+      s.WinRate = 0.0;
+      s.StatusColor = clrSilver;
+
+      switch(i + 1) {
+         case STRAT_CHECKLIST:
+            s.Name = "Checklist";
+            s.StatusColor = clrLime;
+            break;
+         case STRAT_BREAKOUT_RANGE:
+            s.Name = "Breakout";
+            s.StatusColor = clrGold;
+            break;
+         case STRAT_PULLBACK_EMA:
+            s.Name = "Pullback EMA";
+            s.StatusColor = clrOrange;
+            break;
+         case STRAT_SUPERTREND:
+            s.Name = "SuperTrend";
+            s.StatusColor = clrDeepSkyBlue;
+            break;
+         case STRAT_RETEST_SR:
+            s.Name = "Retest SR";
+            s.StatusColor = clrDodgerBlue;
+            break;
+         case STRAT_SCALPING:
+            s.Name = "Scalping";
+            s.StatusColor = clrViolet;
+            break;
+      }
+
+      strategies[strategies_total++] = s;
+   }
+
+   RefreshStrategyStats();
+}
+
+void PerformFullClose() {
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket)) {
+         string pos_symbol = PositionGetString(POSITION_SYMBOL);
+         int pos_magic     = (int)PositionGetInteger(POSITION_MAGIC);
+         if((pos_symbol == _Symbol) && (pos_magic == MagicNumber)) {
+            trade.PositionClose(ticket);
+         }
+      }
+   }
+}
+
+void CheckIntelligentExit() {
+   double totalProfit = 0.0;
+   int openPositions = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket)) {
+         string pos_symbol = PositionGetString(POSITION_SYMBOL);
+         int pos_magic     = (int)PositionGetInteger(POSITION_MAGIC);
+         if((pos_symbol == _Symbol) && (pos_magic == MagicNumber)) {
+            totalProfit += PositionGetDouble(POSITION_PROFIT);
+            openPositions++;
+         }
+      }
+   }
+   
+   double profitThreshold = 50.0;
+   double lossThreshold   = -30.0;
+   bool anomaly = DetectMarketAnomaly();
+
+   if(openPositions > 0) {
+      if(totalProfit >= profitThreshold || totalProfit <= lossThreshold || anomaly) {
+         Print("Full close triggered: total profit=", totalProfit, ", anomaly=", anomaly);
+         PerformFullClose();
+      }
+   }
+}
+
+int OnInit() {
+   string allowedSymbols[] = {"EURUSD", "USDJPY", "EURGBP", "XAUUSD", "GOLD", "BTCUSD"};
+   bool symbolAllowed = false;
+   for(int i=0; i<ArraySize(allowedSymbols); i++) {
+      if(_Symbol == allowedSymbols[i]) {
+         symbolAllowed = true;
+         break;
+      }
+   }
+   
+   if(!symbolAllowed) {
+      Alert("EA DIAMOND v23 can't Trade this Pair/Symbol ", _Symbol);
+      return INIT_FAILED;
+   }
+
+   InitGlobalVars();
+   CheckGoldSymbol();
+
+   for(int i = 0; i < STRATEGY_COUNT; i++) {
+      strategyPerformance[i].strategy = (ENUM_STRATEGY)(i+1);
+      strategyPerformance[i].enabled = true;
+      strategyPerformance[i].weight = 1.0;
+   }
+   
+   EnableSuperTrend = EnableSuperTrendInput; // Initialisation de la variable globale
+   
+   if(!strategyManager.InitializeIndicators()) {
+      Print("Failed to initialize indicators!");
+      return INIT_FAILED;
+   }
+   
+   if(!strategyManager.CheckIndicators()) {
+      Print("Indicator check failed!");
+      return INIT_FAILED;
+   }
+
+   // Vérification du SuperTrend
+   if(EnableSuperTrend) {
+      double st_test[1];
+      if(CopyBuffer(strategyManager.superTrendHandle, 0, 0, 1, st_test) <= 0 || st_test[0] == EMPTY_VALUE) {
+         Print("⚠️ Attention : SuperTrend semble mal initialisé — vérifier les paramètres de iCustom()");
+      } else {
+         Print("✅ SuperTrend initialisé avec une valeur = ", st_test[0]);
+      }
+   }
+
+   InitializeStrategies();
+   LoadStrategyPerformance();
+   EventSetTimer(10);
+   
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {
+   SaveStrategyPerformance();
+   DeleteDashboard();
+   ObjectsDeleteAll(0, "Dashboard_");
+   EventKillTimer();
+}
+
+void OnTick() {
+   // 🔄 Mise à jour du dashboard toutes les secondes
+   static datetime lastDashboardUpdate = 0;
+   if(TimeCurrent() - lastDashboardUpdate >= 1) {
+      UpdateDashboard();
+      lastDashboardUpdate = TimeCurrent();
+   }
+
+   // ⛔ EA désactivé
+   if(!ea_is_active)
+      return;
+
+   // 🕒 S'assurer que le graphique contient assez de barres avant toute logique
+   if(Bars(_Symbol, _Period) < 50) {
+      Print("OnTick - Pas assez de barres chargées pour ", _Symbol, " (", Bars(_Symbol, _Period), ")");
+      return;
+   }
+
+   // 🔍 Vérifie si les indicateurs sont toujours prêts toutes les 30 secondes
+   static datetime lastIndicatorCheck = 0;
+   if(TimeCurrent() - lastIndicatorCheck >= 30) {
+      if(!strategyManager.AreIndicatorsReady()) {
+         Print("Indicators not ready - reinitializing...");
+         if(!strategyManager.InitializeIndicators()) {
+            Alert("Failed to reinitialize indicators!");
+            lastIndicatorCheck = TimeCurrent();
+            return;
+         }
+      }
+      lastIndicatorCheck = TimeCurrent();
+   }
+
+   // 📊 Mise à jour de l'ATR global si disponible
+   double atrValue = GetATR(ATRPeriod);
+   if(atrValue > 0)
+      g_ATRValue = atrValue;
+
+   g_IsGold = IsGold();
+
+   // ❗ Sortie intelligente si conditions critiques
+   CheckIntelligentExit();
+
+   // 🔒 Si on ne peut pas ouvrir de nouvelle position, on gère les positions existantes
+   if(!tradeManager.CanOpenNewPosition(_Symbol)) {
+      tradeManager.ManagePositions();
+      tradeManager.UpdateTrailingStop();
+      return;
+   }
+
+   // 📥 Génération de signal de trading
+   STradeSignal signal;
+   signal.valid = false;
+
+   if(CheckTradingConditions(signal) && signal.valid) {
+      if(!OpenTrade(signal)) {
+         Print("Failed to open trade! Error: ", GetLastError());
+      }
+   }
+
+   // ⚙️ Gestion et mise à jour des stops
+   tradeManager.ManagePositions();
+   tradeManager.UpdateTrailingStop();
+}
+
+void OnTimer() {
+   if(EnableStrategyAutoManagement) {
+      AutoManageStrategies();
+   }
+   
+   UpdateStrategyWeights();
+   UpdateDashboard();
+}
+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam) {
+   if(id == CHARTEVENT_OBJECT_CLICK) {
+      string obj_name = sparam;
+      if(obj_name == "DASHBOARD_CLOSE") {
+         ea_is_active = false;
+         Comment("EA Désactivé");
+      }
+   }
+}
