@@ -2,23 +2,23 @@
 +++ b/DIAMOND_EA_FIXED.mq5
 @@
 -#define clrGray C'100,100,100'
-+// Le gris générique existe déjà dans MQL5 → on retire la redéfinition
-+// Si vous voulez un ton personnalisé : #define clrMediumGray C'100,100,100'
++// Le gris generique existe deja dans MQL5 -> on retire la redefintion
++// Si vous voulez un ton personnalise : #define clrMediumGray C'100,100,100'
 
 @@
-+#//--------------------------------------------------------------------+
-+#  SECTION 1.bis : Wrappers MQL4 → MQL5 pour compatibilité            +
-+#--------------------------------------------------------------------+
++//--------------------------------------------------------------------+
++//  SECTION 1.bis : Wrappers MQL4 -> MQL5 pour compatibilite          +
++//--------------------------------------------------------------------+
 +
-+/// Equivalent MQL4 : IsConnected() (n’existe pas en MQL5)
++// Equivalent MQL4 : IsConnected() (n'existe pas en MQL5)
 +bool IsConnected()
 +  { return (bool)TerminalInfoInteger(TERMINAL_CONNECTED); }
 +
-+/// Equivalent MQL4 : MathIsNaN()
++// Equivalent MQL4 : MathIsNaN()
 +bool MathIsNaN(double v)
 +  { return !(v==v); }
 +
-+/// Lecture simplifiée de l’ATR courant (rend directement la valeur)
++// Lecture simplifiee de l'ATR courant (rend directement la valeur)
 +double GetATR(string symbol, ENUM_TIMEFRAMES tf, int period, int shift=0)
 +{
 +   static int h = INVALID_HANDLE, lastTF = 0, lastPrd = -1;
@@ -35,7 +35,7 @@
 +}
 +
 +//--------------------------------------------------------------------+
-+//  Liste blanche des symboles autorisés (fix : erreur « static array »)
++//  Liste blanche des symboles autorises (fix : erreur "static array")
 +//--------------------------------------------------------------------+
 +string const ALLOWED_SYMBOLS[] =
 +   {"EURUSDm","USDJPYm","EURGBPm","XAUUSDm","GOLDm","BTCUSD"};
